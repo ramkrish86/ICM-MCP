@@ -1,256 +1,269 @@
 #!/usr/bin/env node
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
-import { IcMClient } from "./icm-client.js";
-import { IcMConfig } from "./types.js";
+/**
+ * IcM MCP Proxy Server
+ *
+ * Acts as a local stdio MCP server that proxies all tool calls to the remote
+ * IcM MCP server at https://icm-mcp-prod.azure-api.net/v1/.
+ *
+ * Auth: Uses AzureCliCredential (az login) to acquire tokens for the
+ * api://icmmcpapi-prod resource, injected as Bearer header on each request.
+ */
 
-const config: IcMConfig = {
-  apiBaseUrl: process.env.ICM_API_BASE_URL || "https://icm.ad.msft.net",
-  tenantId: process.env.AZURE_TENANT_ID || "",
-  clientId: process.env.AZURE_CLIENT_ID || "",
-  apiScope: process.env.ICM_API_SCOPE || "api://icmmcpapi-prod/mcp.tools",
-};
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
-const icmClient = new IcMClient(config);
+import { AzureCliCredential } from "@azure/identity";
+import { ReadableStream } from "node:stream/web";
 
-const server = new McpServer({
-  name: "icm-mcp-server",
-  version: "1.0.0",
-});
+// ── Config ──────────────────────────────────────────────────────────────
+const REMOTE_MCP_URL =
+  process.env.ICM_MCP_REMOTE_URL || "https://icm-mcp-prod.azure-api.net/v1/";
+const ICM_SCOPE = process.env.ICM_API_SCOPE || "api://icmmcpapi-prod/.default";
 
-// Tool: Query/Search Incidents
-server.tool(
-  "query_incidents",
-  "Search and filter IcM incidents by team, severity, status, date range, or custom OData filter",
-  {
-    teamId: z.string().optional().describe("Owning team ID to filter by"),
-    severity: z.number().min(1).max(4).optional().describe("Severity level (1=Critical, 2=High, 3=Medium, 4=Low)"),
-    status: z.string().optional().describe("Incident status filter (e.g. Active, Mitigated, Resolved)"),
-    createdAfter: z.string().optional().describe("Filter incidents created after this date (ISO 8601 format)"),
-    createdBefore: z.string().optional().describe("Filter incidents created before this date (ISO 8601 format)"),
-    top: z.number().min(1).max(100).optional().describe("Maximum number of results to return (default: 25)"),
-    filter: z.string().optional().describe("Custom OData $filter expression for advanced queries"),
-  },
-  async (params) => {
-    try {
-      const incidents = await icmClient.queryIncidents(params);
-      const summary = incidents.map((inc) => ({
-        Id: inc.Id,
-        Title: inc.Title,
-        Severity: inc.Severity,
-        Status: inc.Status,
-        OwningTeam: inc.OwningTeamId,
-        Owner: inc.OwningContactAlias,
-        Created: inc.Source?.CreateDate,
-        Mitigated: inc.Mitigated,
-        Resolved: inc.Resolved,
-      }));
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Found ${incidents.length} incident(s):\n\n${JSON.stringify(summary, null, 2)}`,
-          },
-        ],
-      };
-    } catch (error: any) {
-      return {
-        content: [{ type: "text" as const, text: `Error querying incidents: ${error.message}` }],
-        isError: true,
-      };
+// ── Token management ────────────────────────────────────────────────────
+const credential = new AzureCliCredential();
+let cachedToken: string | null = null;
+let tokenExpiry = 0;
+
+async function getToken(): Promise<string> {
+  const now = Date.now();
+  if (cachedToken && now < tokenExpiry - 60_000) return cachedToken;
+  const t = await credential.getToken(ICM_SCOPE);
+  if (!t) throw new Error("Failed to acquire token via Azure CLI. Run: az login");
+  cachedToken = t.token;
+  tokenExpiry = t.expiresOnTimestamp;
+  return cachedToken;
+}
+
+// ── JSON-RPC helpers ────────────────────────────────────────────────────
+let jsonRpcId = 1000;
+let sessionId: string | undefined;
+
+interface JsonRpcRequest {
+  jsonrpc: string;
+  method: string;
+  params?: any;
+  id?: number | string;
+}
+
+interface JsonRpcResponse {
+  jsonrpc: string;
+  result?: any;
+  error?: any;
+  id?: number | string;
+}
+
+/** Send a JSON-RPC request to the remote MCP server and parse SSE response */
+async function remoteCall(method: string, params?: any): Promise<any> {
+  const token = await getToken();
+  const body: JsonRpcRequest = {
+    jsonrpc: "2.0",
+    method,
+    params: params || {},
+    id: jsonRpcId++,
+  };
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+    Accept: "*/*",
+  };
+  if (sessionId) {
+    headers["mcp-session-id"] = sessionId;
+  }
+
+  const resp = await fetch(REMOTE_MCP_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  // Capture session ID from response headers
+  const sid = resp.headers.get("mcp-session-id");
+  if (sid) sessionId = sid;
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`Remote MCP error ${resp.status}: ${errText}`);
+  }
+
+  const text = await resp.text();
+
+  // Parse SSE: look for "data:" lines
+  for (const line of text.split("\n")) {
+    if (line.startsWith("data: ")) {
+      const parsed: JsonRpcResponse = JSON.parse(line.slice(6));
+      if (parsed.error) {
+        throw new Error(
+          `Remote MCP error: ${parsed.error.message || JSON.stringify(parsed.error)}`
+        );
+      }
+      return parsed.result;
     }
   }
-);
 
-// Tool: Get Incident Details
-server.tool(
-  "get_incident",
-  "Get detailed information about a specific IcM incident by its ID",
-  {
-    incidentId: z.number().describe("The IcM incident ID"),
-  },
-  async ({ incidentId }) => {
-    try {
-      const incident = await icmClient.getIncident(incidentId);
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Incident ${incidentId} details:\n\n${JSON.stringify(incident, null, 2)}`,
-          },
-        ],
-      };
-    } catch (error: any) {
-      return {
-        content: [{ type: "text" as const, text: `Error getting incident: ${error.message}` }],
-        isError: true,
-      };
+  // Fallback: try parsing the whole body as JSON
+  try {
+    const parsed: JsonRpcResponse = JSON.parse(text);
+    if (parsed.error)
+      throw new Error(
+        `Remote MCP error: ${parsed.error.message || JSON.stringify(parsed.error)}`
+      );
+    return parsed.result;
+  } catch {
+    throw new Error(`Unexpected remote response: ${text.substring(0, 500)}`);
+  }
+}
+
+// ── Initialize remote session & discover tools ──────────────────────────
+interface RemoteTool {
+  name: string;
+  description: string;
+  inputSchema: any;
+}
+
+let remoteTools: RemoteTool[] = [];
+
+async function initRemote(): Promise<void> {
+  log("Initializing remote IcM MCP session...");
+  await remoteCall("initialize", {
+    protocolVersion: "2024-11-05",
+    capabilities: {},
+    clientInfo: { name: "icm-mcp-proxy", version: "2.0.0" },
+  });
+
+  // Send initialized notification (no id = notification)
+  const token = await getToken();
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+    Accept: "*/*",
+  };
+  if (sessionId) headers["mcp-session-id"] = sessionId;
+
+  await fetch(REMOTE_MCP_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+  });
+
+  const toolsResult = await remoteCall("tools/list", {});
+  remoteTools = toolsResult.tools || [];
+  log(`Discovered ${remoteTools.length} remote tools`);
+}
+
+// ── Local stdio JSON-RPC server ─────────────────────────────────────────
+function log(msg: string) {
+  process.stderr.write(`[icm-mcp-proxy] ${msg}\n`);
+}
+
+function sendResponse(id: number | string | undefined, result: any) {
+  const resp: JsonRpcResponse = { jsonrpc: "2.0", result, id };
+  const json = JSON.stringify(resp);
+  process.stdout.write(json + "\n");
+}
+
+function sendError(id: number | string | undefined, code: number, message: string) {
+  const resp = { jsonrpc: "2.0", error: { code, message }, id };
+  process.stdout.write(JSON.stringify(resp) + "\n");
+}
+
+async function handleRequest(req: JsonRpcRequest) {
+  try {
+    switch (req.method) {
+      case "initialize":
+        // Ensure remote is initialized
+        if (remoteTools.length === 0) await initRemote();
+        sendResponse(req.id, {
+          protocolVersion: "2024-11-05",
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: { name: "icm-mcp-proxy", version: "2.0.0" },
+        });
+        break;
+
+      case "notifications/initialized":
+        // Notification, no response
+        break;
+
+      case "tools/list":
+        if (remoteTools.length === 0) await initRemote();
+        sendResponse(req.id, { tools: remoteTools });
+        break;
+
+      case "tools/call": {
+        const toolName = req.params?.name;
+        const toolArgs = req.params?.arguments || {};
+        log(`Calling remote tool: ${toolName}`);
+        const result = await remoteCall("tools/call", {
+          name: toolName,
+          arguments: toolArgs,
+        });
+        sendResponse(req.id, result);
+        break;
+      }
+
+      case "ping":
+        sendResponse(req.id, {});
+        break;
+
+      default:
+        log(`Unknown method: ${req.method}`);
+        sendError(req.id, -32601, `Method not found: ${req.method}`);
+    }
+  } catch (error: any) {
+    log(`Error handling ${req.method}: ${error.message}`);
+    if (req.id !== undefined) {
+      // For tool calls, return as tool error content (not JSON-RPC error)
+      if (req.method === "tools/call") {
+        sendResponse(req.id, {
+          content: [{ type: "text", text: `Error: ${error.message}` }],
+          isError: true,
+        });
+      } else {
+        sendError(req.id, -32603, error.message);
+      }
     }
   }
-);
+}
 
-// Tool: Create Incident
-server.tool(
-  "create_incident",
-  "Create a new IcM incident",
-  {
-    title: z.string().describe("Incident title"),
-    severity: z.number().min(1).max(4).describe("Severity (1=Critical, 2=High, 3=Medium, 4=Low)"),
-    owningTeamId: z.string().describe("The owning team ID for the incident"),
-    description: z.string().optional().describe("Detailed description of the incident"),
-    owningContactAlias: z.string().optional().describe("Alias of the person who should own the incident"),
-    impactStartDate: z.string().optional().describe("When the impact started (ISO 8601)"),
-    keywords: z.string().optional().describe("Keywords for the incident"),
-    environment: z.string().optional().describe("Environment where the issue occurred"),
-    deviceGroup: z.string().optional().describe("Device group affected"),
-    deviceName: z.string().optional().describe("Specific device name affected"),
-  },
-  async (params) => {
-    try {
-      const incident = await icmClient.createIncident({
-        Title: params.title,
-        Severity: params.severity,
-        OwningTeamId: params.owningTeamId,
-        Description: params.description,
-        OwningContactAlias: params.owningContactAlias,
-        ImpactStartDate: params.impactStartDate || new Date().toISOString(),
-        Keywords: params.keywords,
-        RaisingLocation: {
-          Environment: params.environment,
-          DeviceGroup: params.deviceGroup,
-          DeviceName: params.deviceName,
-        },
-      });
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Incident created successfully!\n\nIncident ID: ${incident.Id}\nTitle: ${incident.Title}\nSeverity: ${incident.Severity}\nStatus: ${incident.Status}`,
-          },
-        ],
-      };
-    } catch (error: any) {
-      return {
-        content: [{ type: "text" as const, text: `Error creating incident: ${error.message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// Tool: Update Incident
-server.tool(
-  "update_incident",
-  "Update an existing IcM incident (severity, status, owner, mitigation)",
-  {
-    incidentId: z.number().describe("The IcM incident ID to update"),
-    severity: z.number().min(1).max(4).optional().describe("New severity level"),
-    status: z.string().optional().describe("New status (e.g. Active, Mitigated, Resolved)"),
-    owningContactAlias: z.string().optional().describe("New owner alias"),
-    mitigationData: z.string().optional().describe("Mitigation details/notes"),
-    mitigated: z.boolean().optional().describe("Mark incident as mitigated"),
-    resolved: z.boolean().optional().describe("Mark incident as resolved"),
-  },
-  async (params) => {
-    try {
-      const update: any = {};
-      if (params.severity !== undefined) update.Severity = params.severity;
-      if (params.status !== undefined) update.Status = params.status;
-      if (params.owningContactAlias !== undefined) update.OwningContactAlias = params.owningContactAlias;
-      if (params.mitigationData !== undefined) update.MitigationData = params.mitigationData;
-      if (params.mitigated !== undefined) update.Mitigated = params.mitigated;
-      if (params.resolved !== undefined) update.Resolved = params.resolved;
-
-      await icmClient.updateIncident(params.incidentId, update);
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Incident ${params.incidentId} updated successfully.\nUpdated fields: ${Object.keys(update).join(", ")}`,
-          },
-        ],
-      };
-    } catch (error: any) {
-      return {
-        content: [{ type: "text" as const, text: `Error updating incident: ${error.message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// Tool: Add Troubleshooting Entry
-server.tool(
-  "add_troubleshooting_entry",
-  "Add a troubleshooting note or entry to an IcM incident",
-  {
-    incidentId: z.number().describe("The IcM incident ID"),
-    title: z.string().describe("Title of the troubleshooting entry"),
-    description: z.string().describe("Detailed content of the troubleshooting entry"),
-    entryType: z.string().optional().describe("Entry type (default: 'Note')"),
-  },
-  async (params) => {
-    try {
-      await icmClient.addTroubleshootingEntry({
-        IncidentId: params.incidentId,
-        Title: params.title,
-        Description: params.description,
-        EntryType: params.entryType,
-      });
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Troubleshooting entry added to incident ${params.incidentId}.\nTitle: ${params.title}`,
-          },
-        ],
-      };
-    } catch (error: any) {
-      return {
-        content: [{ type: "text" as const, text: `Error adding entry: ${error.message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// Tool: Get Troubleshooting Entries
-server.tool(
-  "get_troubleshooting_entries",
-  "Get all troubleshooting entries/notes for an IcM incident",
-  {
-    incidentId: z.number().describe("The IcM incident ID"),
-  },
-  async ({ incidentId }) => {
-    try {
-      const entries = await icmClient.getIncidentTroubleshootingEntries(incidentId);
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Troubleshooting entries for incident ${incidentId}:\n\n${JSON.stringify(entries, null, 2)}`,
-          },
-        ],
-      };
-    } catch (error: any) {
-      return {
-        content: [{ type: "text" as const, text: `Error getting entries: ${error.message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// Start the server
+// ── Main: read stdin line-by-line ───────────────────────────────────────
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("IcM MCP Server started successfully");
+  log("IcM MCP Proxy Server starting...");
+  log(`Remote: ${REMOTE_MCP_URL}`);
+  log(`Scope: ${ICM_SCOPE}`);
+
+  // Pre-initialize remote connection
+  try {
+    await initRemote();
+  } catch (err: any) {
+    log(`Warning: pre-init failed (will retry on first request): ${err.message}`);
+  }
+
+  let buffer = "";
+  process.stdin.setEncoding("utf-8");
+  process.stdin.on("data", (chunk: string) => {
+    buffer += chunk;
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const req: JsonRpcRequest = JSON.parse(trimmed);
+        handleRequest(req);
+      } catch (err: any) {
+        log(`Failed to parse request: ${err.message}`);
+      }
+    }
+  });
+
+  process.stdin.on("end", () => {
+    log("stdin closed, shutting down");
+    process.exit(0);
+  });
 }
 
 main().catch((error) => {
-  console.error("Fatal error starting IcM MCP server:", error);
+  log(`Fatal error: ${error.message}`);
   process.exit(1);
 });
